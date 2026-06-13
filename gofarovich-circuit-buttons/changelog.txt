@@ -1,0 +1,9 @@
+---------------------------------------------------------------------------------------------------
+Version: 0.1.0
+Date: 2026-06-13
+  Features:
+    - Initial release: Pulse button combinator (timed pulse) and Switch button combinator (toggle).
+    - 1x1 circuit-network buttons; rotate to the terminal side to open settings.
+    - Configurable active/idle signal, pulse length, and per-entity description; blueprint support.
+    - "Connected to" network status in the settings window.
+    - Back signal: drive the button on/off from circuit conditions (enable/disable), with manual lock-out.
