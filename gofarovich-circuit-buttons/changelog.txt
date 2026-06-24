@@ -1,9 +1,17 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.2.0
+Date: 2026-06-24
+  Changes:
+    - big gui rework! so big it didn't fit here anymore, so the gui stuff now lives in its own mod (gglib)
+    - settings window feels nicer to use now
+  Info:
+    - this mod now needs gglib to work, the game will grab it for you
+---------------------------------------------------------------------------------------------------
 Version: 0.1.0
 Date: 2026-06-13
   Features:
-    - Initial release: Pulse button combinator (timed pulse) and Switch button combinator (toggle).
-    - 1x1 circuit-network buttons; rotate to the terminal side to open settings.
-    - Configurable active/idle signal, pulse length, and per-entity description; blueprint support.
-    - "Connected to" network status in the settings window.
-    - Back signal: drive the button on/off from circuit conditions (enable/disable), with manual lock-out.
+    - first release! two 1x1 buttons: a pulse one and a switch one, click them to fire a signal
+    - turn a button to the settings side to open its settings
+    - pick your active/idle signal, set pulse length, write a little description per button, works in blueprints
+    - the settings window shows what network you're connected to
+    - back signal: drive the button on/off from circuit conditions, with a manual lock if you want to keep control

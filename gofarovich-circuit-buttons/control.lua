@@ -1,3 +1,7 @@
+local SP = require("__gglib__.signal_picker")  -- общий пикер из мода-библиотеки gglib
+local SB = require("__gglib__.signal_button")  -- слот-кнопка операнда (открывает пикер) из gglib
+local CS = require("__gglib__.connection_status")  -- панель «Connected to» из gglib
+
 local NAMES = { ["gofarovich-bc-pulse"] = true, ["gofarovich-bc-switch"] = true }
 local GUI_NAME = "gofarovich-bc-btn-gui"
 local CLOSE_NAME = "gofarovich-bc-close"
@@ -7,17 +11,27 @@ local DESC_BOX = "gofarovich-bc-desc-box"
 local DESC_SAVE = "gofarovich-bc-desc-save"
 local DESC_CANCEL = "gofarovich-bc-desc-cancel"
 local DESC_EMOJI = "gofarovich-bc-desc-emoji"
+-- Pulse-length operand slot: a single slot (signal OR constant), opening our picker
+-- — same widget as a condition's right operand.
 local DURATION_NAME = "gofarovich-bc-duration"
 local BACK_NAME = "gofarovich-bc-back"
-local EN_SIG, EN_CMP, EN_TOG, EN_SIG2, EN_CONST = "gofarovich-bc-en-sig", "gofarovich-bc-en-cmp", "gofarovich-bc-en-tog", "gofarovich-bc-en-sig2", "gofarovich-bc-en-const"
-local DIS_SIG, DIS_CMP, DIS_TOG, DIS_SIG2, DIS_CONST = "gofarovich-bc-dis-sig", "gofarovich-bc-dis-cmp", "gofarovich-bc-dis-tog", "gofarovich-bc-dis-sig2", "gofarovich-bc-dis-const"
+-- Левый операнд + компаратор остаются нативными; правый операнд (EN_OP/DIS_OP) — слот,
+-- открывающий наш пикер (сигнал ИЛИ константа).
+local EN_SIG, EN_CMP, EN_OP = "gofarovich-bc-en-sig", "gofarovich-bc-en-cmp", "gofarovich-bc-en-op"
+local DIS_SIG, DIS_CMP, DIS_OP = "gofarovich-bc-dis-sig", "gofarovich-bc-dis-cmp", "gofarovich-bc-dis-op"
 local COMPARATORS = { "<", ">", "=", "≥", "≤", "≠" }
+
+-- Подложка условия (как у условий рельса): обычная рамка vs «выполнено». Меняем
+-- заливку живьём в on_tick, пока окно открыто.
+local FRAME_NORMAL = "decider_combinator_frame"
+local FRAME_LIT    = "gofarovich-bc-cond-fulfilled-frame"
 
 local function init_storage()
   storage.buttons = storage.buttons or {}
   storage.pending = storage.pending or {}
   storage.open_gui = storage.open_gui or {}
   storage.auto = storage.auto or {} -- unit_number -> true, for back-signal buttons
+  storage.cond_frames = storage.cond_frames or {} -- player.index -> { unit, rows } (живая подсветка)
 end
 
 script.on_init(init_storage)
@@ -28,7 +42,9 @@ local function register(entity)
     -- default to the green check signal (a fresh table per button, not shared)
     active_signal = { type = "virtual", name = "signal-check" },
     inactive_signal = nil,
-    duration = 1, -- pulse length in ticks (pulse button)
+    -- pulse length in ticks (pulse button): signal-or-constant, like a condition's
+    -- right operand. In signal mode the length is read live from the circuit network.
+    duration = { use_signal = false, second_signal = nil, constant = 1 },
     state = false,
     auto = false, -- back-signal: drive state from circuit conditions
     enable_cond  = { signal = nil, comparator = "=", use_signal = false, second_signal = nil, constant = 0 },
@@ -71,6 +87,28 @@ local function net_value(entity, signal)
   local g = entity.get_circuit_network(GREEN)
   if g then total = total + g.get_signal(signal) end
   return total
+end
+
+-- Normalise a duration that may be an old plain-number value (pre-signal-input
+-- versions and old blueprints) into the signal-or-constant table form.
+local function norm_duration(d)
+  if type(d) == "number" then
+    return { use_signal = false, second_signal = nil, constant = math.max(1, math.floor(d)) }
+  end
+  return d or { use_signal = false, second_signal = nil, constant = 1 }
+end
+
+-- Effective pulse length in ticks: live network value in signal mode, else the
+-- constant. Always at least 1 tick.
+local function pulse_duration(data, entity)
+  local d = data.duration
+  local v
+  if d.use_signal and d.second_signal and d.second_signal.name then
+    v = net_value(entity, d.second_signal)
+  else
+    v = d.constant or 1
+  end
+  return math.max(1, math.floor(v))
 end
 
 local CMP = {
@@ -133,6 +171,7 @@ script.on_configuration_changed(function()
       -- back-fill fields added in newer versions
       data.enable_cond = data.enable_cond or { signal = nil, comparator = "=", use_signal = false, second_signal = nil, constant = 0 }
       data.disable_cond = data.disable_cond or { signal = nil, comparator = "=", use_signal = false, second_signal = nil, constant = 0 }
+      data.duration = norm_duration(data.duration)
       data.auto = data.auto or false
       if data.auto then storage.auto[unit_number] = true end
       apply_visual(data)
@@ -158,7 +197,7 @@ end
 -- Re-pressing during a pulse extends it: off_tick tracks the latest end so older
 -- scheduled releases are ignored.
 local function press_pulse(data)
-  local off = game.tick + math.max(1, data.duration or 1)
+  local off = game.tick + pulse_duration(data, data.entity)
   data.off_tick = off
   set_state(data, true, "gofarovich-bc-press")
   storage.pending[off] = storage.pending[off] or {}
@@ -167,6 +206,39 @@ end
 
 local function press_switch(data)
   set_state(data, not data.state, data.state and "gofarovich-bc-release" or "gofarovich-bc-press")
+end
+
+-- Заливка панели условия: обычная / «выполнено». Смена named-style сбрасывает
+-- свойства стиля — переустанавливаем растяжку и паддинг.
+local function apply_cond_frame(panel, lit)
+  panel.style = lit and FRAME_LIT or FRAME_NORMAL
+  panel.style.horizontally_stretchable = true
+  -- максимально компактная рамка условия: без внутренних отступов и зазоров.
+  -- свойства переустанавливаем здесь, т.к. смена стиля при подсветке их сбрасывает.
+  panel.style.padding = 0
+  panel.style.bottom_margin = 0
+end
+
+-- Живая подсветка панелей условий у открытых окон: активная подложка, пока условие
+-- выполняется (как у условий рельса).
+local function update_cond_frames()
+  for pi, st in pairs(storage.cond_frames) do
+    local data = storage.buttons[st.unit]
+    if data and data.entity.valid and data.auto then
+      for _, r in ipairs(st.rows) do
+        if r.panel and r.panel.valid then
+          local cond = (r.which == "enable") and data.enable_cond or data.disable_cond
+          local lit = eval_cond(data.entity, cond)
+          if lit ~= r.lit then
+            apply_cond_frame(r.panel, lit)
+            r.lit = lit
+          end
+        end
+      end
+    else
+      storage.cond_frames[pi] = nil
+    end
+  end
 end
 
 script.on_event(defines.events.on_tick, function(event)
@@ -201,24 +273,25 @@ script.on_event(defines.events.on_tick, function(event)
       storage.auto[unit_number] = nil
     end
   end
-end)
 
--- "Connected to: <red id> <green id>" line; placed on a dark subheader bar.
-local function add_connection_status(parent, entity)
-  local bar = parent.add{ type = "frame", style = "subheader_frame" }
-  bar.style.horizontally_stretchable = true
-  local flow = bar.add{ type = "flow", direction = "horizontal" }
-  flow.style.vertical_align = "center"
-  flow.add{ type = "label", style = "subheader_label", caption = { "gofarovich-bc-gui.connected-to" } }
-  local r = entity.get_circuit_network(RED)
-  local g = entity.get_circuit_network(GREEN)
-  if not r and not g then
-    flow.add{ type = "label", style = "subheader_label", caption = { "gofarovich-bc-gui.not-connected" } }
-  else
-    if r then flow.add{ type = "label", style = "subheader_label", caption = "[color=255,90,90]" .. r.network_id .. "[/color]" } end
-    if g then flow.add{ type = "label", style = "subheader_label", caption = "[color=90,255,90]" .. g.network_id .. "[/color]" } end
+  -- Закрываем окно, если игрок отошёл от кнопки слишком далеко (как ванильные окна).
+  for player_index, unit_number in pairs(storage.open_gui) do
+    local player = game.get_player(player_index)
+    local data = storage.buttons[unit_number]
+    if not (player and data and data.entity.valid) then
+      if player then player.opened = nil end
+    else
+      local p, e = player.position, data.entity.position
+      local dx, dy = p.x - e.x, p.y - e.y
+      local max = player.reach_distance + 4
+      if player.surface ~= data.entity.surface or (dx * dx + dy * dy) > max * max then
+        player.opened = nil -- триггерит on_gui_closed → окно уничтожается
+      end
+    end
   end
-end
+
+  update_cond_frames()
+end)
 
 local function cmp_index(comparator)
   for i, c in ipairs(COMPARATORS) do
@@ -227,31 +300,42 @@ local function cmp_index(comparator)
   return 3 -- "="
 end
 
--- One condition row: [label] [signal] [comparator] [toggle] [number OR signal].
--- The right operand is a SINGLE slot: a constant field or a signal picker; the
--- small toggle button switches between the two (one is shown at a time).
-local function add_condition_row(parent, label_key, sig_name, cmp_name, tog_name, sig2_name, const_name, cond)
-  parent.add{ type = "label", caption = { label_key } }
-  local row = parent.add{ type = "flow", direction = "horizontal" }
+-- Правый операнд = ОДИН слот (сигнал со значком качества ИЛИ константа-число),
+-- собранный gglib-кнопкой signal_button. Клик по ней (через SB.on_click) открывает
+-- наш пикер; результат приходит в SP.set_on_pick по `target`.
+--   cond  — таблица { use_signal, second_signal, constant } (условие или data.duration).
+--   target — что вернётся в on_pick ({ unit, cond = "enable"|"disable"|"duration" }).
+--   extra — доп. опции пикера (allow_constant / allow_wildcards / constant_only).
+local function add_operand_slot(row, op_name, cond, target, extra)
+  local opts = {
+    target = target,
+    name = op_name,
+    size = 40,
+    value = { use_signal = cond.use_signal, signal = cond.second_signal, constant = cond.constant },
+  }
+  if extra then for k, v in pairs(extra) do opts[k] = v end end
+  return SB.build(row, opts)
+end
+
+-- One condition as its own panel: [label] over [signal] [comparator] [right operand slot].
+-- Подложка — как у условий рельса (decider_combinator_frame), активная при выполнении.
+local function add_condition_row(parent, label_key, sig_name, cmp_name, op_name, cond, lit, target)
+  local panel = parent.add{ type = "frame", style = FRAME_NORMAL, direction = "vertical" }
+  apply_cond_frame(panel, lit)
+  local row = panel.add{ type = "flow", direction = "horizontal" }
   row.style.vertical_align = "center"
+  row.style.horizontal_spacing = 6
+  row.style.horizontally_stretchable = true
+  local cap = row.add{ type = "label", style = "caption_label", caption = { label_key } }
+  cap.style.left_margin = 4
+  -- название слева, условие притянуто к правому краю
+  local filler = row.add{ type = "empty-widget" }
+  filler.style.horizontally_stretchable = true
   row.add{ type = "choose-elem-button", name = sig_name, elem_type = "signal", signal = cond.signal }
   local dd = row.add{ type = "drop-down", name = cmp_name, items = COMPARATORS, selected_index = cmp_index(cond.comparator) }
   dd.style.width = 52
-  local tog = row.add{
-    type = "sprite-button", name = tog_name, style = "tool_button",
-    sprite = "utility/change_recipe", tooltip = { "gofarovich-bc-gui.operand-toggle-tt" },
-  }
-  tog.style.size = 28
-  if cond.use_signal then
-    row.add{ type = "choose-elem-button", name = sig2_name, elem_type = "signal", signal = cond.second_signal }
-  else
-    local c = row.add{
-      type = "textfield", name = const_name,
-      numeric = true, allow_decimal = false, allow_negative = true,
-      text = tostring(cond.constant or 0),
-    }
-    c.style.width = 70
-  end
+  add_operand_slot(row, op_name, cond, target, { allow_constant = true, allow_wildcards = false })
+  return panel
 end
 
 -- Rich-text tag for inserting a signal/icon into the description text.
@@ -297,15 +381,24 @@ local function open_gui(player, data)
     tooltip = { "gui.close" },
   }
 
-  -- "Connected to" on its own dark subheader bar, under the titlebar
-  add_connection_status(frame, data.entity)
-
   -- Content frame, vanilla entity-GUI style
   local content = frame.add{
     type = "frame",
     style = "entity_frame",
     direction = "vertical",
   }
+
+  -- "Connected to" at the top of the content frame, hugging its top & side edges
+  -- (negative margins cancel the entity_frame's inner padding; only a bottom gap remains).
+  local cs_bar = CS.add(content, data.entity, {
+    mode  = "single",
+    red   = defines.wire_connector_id.combinator_input_red,
+    green = defines.wire_connector_id.combinator_input_green,
+  })
+  cs_bar.style.top_margin = -12
+  cs_bar.style.left_margin = -12
+  cs_bar.style.right_margin = -12
+  cs_bar.style.bottom_margin = 8
 
   -- Status line (lamp + "Working"), like vanilla machine windows
   local status = content.add{ type = "flow", direction = "horizontal" }
@@ -327,44 +420,62 @@ local function open_gui(player, data)
 
   -- Signals
   local tbl = content.add{ type = "table", name = "tbl", column_count = 2 }
-  tbl.add{ type = "label", caption = { "gofarovich-bc-gui.active-signal" } }
+  tbl.style.horizontally_stretchable = true
+  -- Подписи слева тянутся, прижимая инпуты ко второму столбцу — к правому краю.
+  tbl.add{ type = "label", caption = { "gofarovich-bc-gui.active-signal" } }.style.horizontally_stretchable = true
   tbl.add{ type = "choose-elem-button", name = "gofarovich-bc-active-signal", elem_type = "signal", signal = data.active_signal }
-  tbl.add{ type = "label", caption = { "gofarovich-bc-gui.inactive-signal" } }
+  tbl.add{ type = "label", caption = { "gofarovich-bc-gui.inactive-signal" } }.style.horizontally_stretchable = true
   tbl.add{ type = "choose-elem-button", name = "gofarovich-bc-inactive-signal", elem_type = "signal", signal = data.inactive_signal }
 
   if data.entity.name == "gofarovich-bc-pulse" then
-    tbl.add{ type = "label", caption = { "gofarovich-bc-gui.duration" }, tooltip = { "gofarovich-bc-gui.duration-tt" } }
-    local dur = tbl.add{
-      type = "textfield",
-      name = DURATION_NAME,
-      numeric = true,
-      allow_decimal = false,
-      allow_negative = false,
-      text = tostring(data.duration or 1),
-    }
-    dur.style.width = 60
+    tbl.add{ type = "label", caption = { "gofarovich-bc-gui.duration" }, tooltip = { "gofarovich-bc-gui.duration-tt" } }.style.horizontally_stretchable = true
+    data.duration = norm_duration(data.duration)
+    add_operand_slot(tbl, DURATION_NAME, data.duration,
+      { unit = data.entity.unit_number, cond = "duration" }, { constant_only = true })
   end
 
   content.add{ type = "line" }.style.margin = 4
 
-  -- Back-signal: drive the button's state from circuit conditions
-  content.add{
+  -- Back-signal: drive the button's state from circuit conditions. Тултип — на
+  -- значке (?) справа от подписи, а не на самой подписи/чекбоксе.
+  local back_flow = content.add{ type = "flow", direction = "horizontal" }
+  back_flow.style.vertical_align = "center"
+  back_flow.add{
     type = "checkbox",
     name = BACK_NAME,
     caption = { "gofarovich-bc-gui.back-signal" },
-    tooltip = { "gofarovich-bc-gui.back-signal-tt" },
     state = data.auto,
   }
+  local help = back_flow.add{
+    type = "sprite", sprite = "info", tooltip = { "gofarovich-bc-gui.back-signal-tt" },
+  }
+  help.style.size = 16
+  help.style.left_margin = 4
+  storage.cond_frames[player.index] = nil
   if data.auto then
-    local conds = content.add{ type = "table", column_count = 2 }
+    -- Common panel that holds each condition in its own sub-panel.
+    local conds = content.add{ type = "frame", style = "deep_frame_in_shallow_frame", direction = "vertical" }
     conds.style.top_margin = 4
-    add_condition_row(conds, "gofarovich-bc-gui.enable-cond", EN_SIG, EN_CMP, EN_TOG, EN_SIG2, EN_CONST, data.enable_cond)
-    add_condition_row(conds, "gofarovich-bc-gui.disable-cond", DIS_SIG, DIS_CMP, DIS_TOG, DIS_SIG2, DIS_CONST, data.disable_cond)
+    conds.style.padding = 0
+    conds.style.horizontally_stretchable = true
+    local en_panel = add_condition_row(conds, "gofarovich-bc-gui.enable-cond", EN_SIG, EN_CMP, EN_OP,
+      data.enable_cond, eval_cond(data.entity, data.enable_cond),
+      { unit = data.entity.unit_number, cond = "enable" })
+    local dis_panel = add_condition_row(conds, "gofarovich-bc-gui.disable-cond", DIS_SIG, DIS_CMP, DIS_OP,
+      data.disable_cond, eval_cond(data.entity, data.disable_cond),
+      { unit = data.entity.unit_number, cond = "disable" })
+    storage.cond_frames[player.index] = { unit = data.entity.unit_number, rows = {
+      { panel = en_panel, which = "enable", lit = false },
+      { panel = dis_panel, which = "disable", lit = false },
+    } }
   end
 
   -- Description at the bottom, under a separator. When set: a "Description" header
   -- with a pencil-edit button, and the text shown below it (like vanilla).
-  content.add{ type = "line" }.style.margin = 4
+  -- разделитель над описанием скрываем, когда раскрыты условия фидбека
+  if not data.auto then
+    content.add{ type = "line" }.style.margin = 4
+  end
   local desc = data.entity.combinator_description
   if desc and desc ~= "" then
     local head = content.add{ type = "flow", direction = "horizontal" }
@@ -386,6 +497,33 @@ local function open_gui(player, data)
   storage.open_gui[player.index] = data.entity.unit_number
   player.opened = frame
 end
+
+-- Результат пикера → правый операнд условия (target.cond = "enable"|"disable").
+SP.set_on_pick(function(player, target, result, changed)
+  local data = storage.buttons[target.unit]
+  if not (data and data.entity.valid) then return end
+  if changed and target.cond == "duration" then
+    -- только число: константа → длина импульса (минимум 1 тик)
+    local n = (result and result.constant) or 1
+    data.duration = { use_signal = false, second_signal = nil, constant = math.max(1, math.floor(n)) }
+    open_gui(player, data)
+    return
+  end
+  if changed then
+    local cond = (target.cond == "enable") and data.enable_cond or data.disable_cond
+    if result and result.constant ~= nil then
+      cond.use_signal = false
+      cond.constant = math.floor(result.constant)
+    elseif result and result.signal then
+      cond.use_signal = true
+      cond.second_signal = result.signal
+    else  -- очистить → константа 0
+      cond.use_signal = false
+      cond.constant = 0
+    end
+  end
+  open_gui(player, data)  -- переоткрыть окно кнопки (и после выбора, и после cancel)
+end)
 
 -- Separate "Edit description" dialog, opened from the description button.
 local function open_desc_editor(player, data)
@@ -454,9 +592,14 @@ script.on_event(defines.events.on_gui_opened, function(event)
 end)
 
 script.on_event(defines.events.on_gui_closed, function(event)
+  if SP.on_closed(event) then return end
   local element = event.element
   if not (element and element.valid) or element.name ~= GUI_NAME then return end
+  -- Opening the picker sets player.opened = picker, which fires this for the button
+  -- window. Keep the window alive behind the picker (like the native signal fields).
+  if SP.is_open(game.get_player(event.player_index)) then return end
   storage.open_gui[event.player_index] = nil
+  storage.cond_frames[event.player_index] = nil
   local edit = game.get_player(event.player_index).gui.screen[DESC_EDIT_FRAME]
   if edit then edit.destroy() end
   element.destroy()
@@ -482,6 +625,8 @@ local function refocus_main(player)
 end
 
 script.on_event(defines.events.on_gui_click, function(event)
+  if SP.on_click(event) then return end
+  if SB.on_click(event) then return end  -- слот операнда → gglib откроет пикер
   local name = event.element.name
   local player = game.get_player(event.player_index)
   if name == CLOSE_NAME then
@@ -490,6 +635,7 @@ script.on_event(defines.events.on_gui_click, function(event)
     local frame = player.gui.screen[GUI_NAME]
     if frame then frame.destroy() end
     storage.open_gui[event.player_index] = nil
+    storage.cond_frames[event.player_index] = nil
     return
   end
   local data = get_open_data(event)
@@ -508,13 +654,8 @@ script.on_event(defines.events.on_gui_click, function(event)
     local edit = player.gui.screen[DESC_EDIT_FRAME]
     if edit then edit.destroy() end
     refocus_main(player)
-  elseif name == EN_TOG then
-    data.enable_cond.use_signal = not data.enable_cond.use_signal
-    open_gui(player, data) -- rebuild to swap number <-> signal in the slot
-  elseif name == DIS_TOG then
-    data.disable_cond.use_signal = not data.disable_cond.use_signal
-    open_gui(player, data)
   end
+  -- Слоты операндов (EN_OP/DIS_OP/DURATION_NAME) открывают пикер через SB.on_click выше.
 end)
 
 script.on_event(defines.events.on_gui_elem_changed, function(event)
@@ -531,10 +672,6 @@ script.on_event(defines.events.on_gui_elem_changed, function(event)
     data.enable_cond.signal = event.element.elem_value
   elseif name == DIS_SIG then
     data.disable_cond.signal = event.element.elem_value
-  elseif name == EN_SIG2 then
-    data.enable_cond.second_signal = event.element.elem_value
-  elseif name == DIS_SIG2 then
-    data.disable_cond.second_signal = event.element.elem_value
   elseif name == DESC_EMOJI then
     -- insert the picked signal as a rich-text icon into the description text
     local edit = game.get_player(event.player_index).gui.screen[DESC_EDIT_FRAME]
@@ -566,16 +703,12 @@ script.on_event(defines.events.on_gui_checked_state_changed, function(event)
 end)
 
 script.on_event(defines.events.on_gui_text_changed, function(event)
-  local name = event.element.name
-  local data = get_open_data(event)
-  if not data then return end
-  if name == DURATION_NAME then
-    data.duration = math.max(1, tonumber(event.element.text) or 1)
-  elseif name == EN_CONST then
-    data.enable_cond.constant = tonumber(event.element.text) or 0
-  elseif name == DIS_CONST then
-    data.disable_cond.constant = tonumber(event.element.text) or 0
-  end
+  SP.on_text(event)  -- поиск/поле константы пикера
+end)
+
+-- Ползунок константы в пикере (у мода нет других слайдеров).
+script.on_event(defines.events.on_gui_value_changed, function(event)
+  SP.on_value(event)
 end)
 
 script.on_event(defines.events.on_player_rotated_entity, function(event)
@@ -598,7 +731,8 @@ script.on_event(defines.events.on_entity_settings_pasted, function(event)
   end
   dst_data.active_signal = src_data.active_signal
   dst_data.inactive_signal = src_data.inactive_signal
-  dst_data.duration = src_data.duration
+  local sd = norm_duration(src_data.duration)
+  dst_data.duration = { use_signal = false, second_signal = sd.second_signal, constant = sd.constant }
   dst_data.auto = src_data.auto
   dst_data.enable_cond = copy_cond(src_data.enable_cond)
   dst_data.disable_cond = copy_cond(src_data.disable_cond)
@@ -621,7 +755,7 @@ local function on_built(event)
   if t then
     data.active_signal = t.active
     data.inactive_signal = t.inactive
-    if t.duration then data.duration = t.duration end
+    if t.duration then data.duration = norm_duration(t.duration) end
     data.state = t.state or false
     if t.desc and t.desc ~= "" then entity.combinator_description = t.desc end
     data.auto = t.auto or false

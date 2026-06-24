@@ -1,11 +1,11 @@
 {
   "name": "button-combinator",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "title": "Button Combinator (vanilla style)",
   "author": "gofarovich",
   "contact": "https://discord.gg/tvV9ts8jxm",
   "homepage": "https://github.com/Master-Ferrari/factorio-button-combinator",
   "factorio_version": "2.0",
-  "dependencies": ["base >= 2.0"],
+  "dependencies": ["base >= 2.0", "gglib >= 1.0.0"],
   "description": "Two 1x1 buttons: a pulse and a switch, activated by mouse click. Rotate to the terminal side to access settings."
 }
