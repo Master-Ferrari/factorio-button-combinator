@@ -95,14 +95,9 @@ end
 make_button("gofarovich-bc-pulse", "icon-pulse.png")
 make_button("gofarovich-bc-switch", "icon-switch.png")
 
--- Разблокировка рецептов кнопок в исследовании Circuit network
--- (https://wiki.factorio.com/Circuit_network_(research)).
-local circuit_tech = data.raw["technology"]["circuit-network"]
-if circuit_tech then
-  circuit_tech.effects = circuit_tech.effects or {}
-  table.insert(circuit_tech.effects, { type = "unlock-recipe", recipe = "gofarovich-bc-pulse" })
-  table.insert(circuit_tech.effects, { type = "unlock-recipe", recipe = "gofarovich-bc-switch" })
-end
+-- Разблокировка рецептов кнопок висит на Circuit network и живёт целиком в
+-- data-updates.lua — здесь её быть не должно, иначе эффекты добавятся дважды и
+-- в окне исследования кнопки покажутся по два раза.
 
 -- Remnant left on the ground after a button is destroyed. `animation` is a list
 -- of variations, so the engine picks one of the two husk cells at random.

@@ -1,4 +1,10 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.3.3
+Date: 2026-09-04
+  Bugfixes:
+    - the buttons no longer show up twice in the Circuit network research window -
+      the mod was adding its recipe unlocks to that tech two times over
+---------------------------------------------------------------------------------------------------
 Version: 0.3.2
 Date: 2026-09-04
   Changes:
