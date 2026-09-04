@@ -24,6 +24,7 @@
 |---|---|---|
 | `atlas.png` | 512×256 | основной арт (8 кадров), подключён в `data.lua` |
 | `atlas-shadow.png` | 512×256 | тень, выводится из `atlas.png` через `tools/build_shadow.py`; подключена слоем `draw_as_shadow` |
+| `luminance.png` | 512×256 | свечение (та же раскладка, что `atlas.png`; арт только в «on»-ячейках, фон непрозрачный чёрный); подключён слоем `draw_as_glow` + `blend_mode = "additive"` |
 | `husk.png` | 256×128 | остов/remnant: 2 вариации (рандом), подключён через `corpse`. **Заглушка — заменить артом** |
 | `icon-pulse.png` / `icon-switch.png` | 128×128 | иконки, выводятся из `atlas.png` через `tools/build_icons.py` |
 

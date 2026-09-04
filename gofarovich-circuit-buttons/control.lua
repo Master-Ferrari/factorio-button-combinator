@@ -32,6 +32,7 @@ local function init_storage()
   storage.open_gui = storage.open_gui or {}
   storage.auto = storage.auto or {} -- unit_number -> true, for back-signal buttons
   storage.cond_frames = storage.cond_frames or {} -- player.index -> { unit, rows } (живая подсветка)
+  storage.undo_stash = storage.undo_stash or {} -- "surface:name:x:y" -> настройки снесённых кнопок (для undo/redo)
 end
 
 script.on_init(init_storage)
@@ -41,7 +42,9 @@ local function register(entity)
     entity = entity,
     -- default to the green check signal (a fresh table per button, not shared)
     active_signal = { type = "virtual", name = "signal-check" },
+    active_count = 1,
     inactive_signal = nil,
+    inactive_count = 1,
     -- pulse length in ticks (pulse button): signal-or-constant, like a condition's
     -- right operand. In signal mode the length is read live from the circuit network.
     duration = { use_signal = false, second_signal = nil, constant = 1 },
@@ -145,10 +148,11 @@ local function set_output(data)
   local cb = data.entity.get_or_create_control_behavior()
   local section = cb.get_section(1) or cb.add_section()
   local signal = data.state and data.active_signal or data.inactive_signal
+  local count = data.state and (data.active_count or 1) or (data.inactive_count or 1)
   if signal and signal.name then
     section.set_slot(1, {
-      value = { type = signal.type or "virtual", name = signal.name, quality = "normal" },
-      min = 1, -- constant-combinator outputs this count
+      value = { type = signal.type or "virtual", name = signal.name, quality = signal.quality or "normal" },
+      min = count, -- constant-combinator outputs this count
     })
   else
     section.clear_slot(1)
@@ -169,6 +173,8 @@ script.on_configuration_changed(function()
   for unit_number, data in pairs(storage.buttons) do
     if data.entity and data.entity.valid then
       -- back-fill fields added in newer versions
+      data.active_count = data.active_count or 1
+      data.inactive_count = data.inactive_count or 1
       data.enable_cond = data.enable_cond or { signal = nil, comparator = "=", use_signal = false, second_signal = nil, constant = 0 }
       data.disable_cond = data.disable_cond or { signal = nil, comparator = "=", use_signal = false, second_signal = nil, constant = 0 }
       data.duration = norm_duration(data.duration)
@@ -191,17 +197,22 @@ local function set_state(data, state, sound)
   end
 end
 
+-- Arm the auto-release `ticks` from now. off_tick tracks the latest scheduled end,
+-- so releases queued by an earlier press are ignored when a re-press extends it.
+local function schedule_release(data, ticks)
+  local off = game.tick + math.max(1, math.floor(ticks or 1))
+  data.off_tick = off
+  storage.pending[off] = storage.pending[off] or {}
+  table.insert(storage.pending[off], data.entity.unit_number)
+end
+
 -- Click emits the active signal for `duration` ticks, then auto-releases.
 -- (Mouse-up is not exposed by the Factorio API, so a true "hold while pressed"
 -- is impossible; a self-extinguishing timed pulse is the practical equivalent.)
--- Re-pressing during a pulse extends it: off_tick tracks the latest end so older
--- scheduled releases are ignored.
+-- Re-pressing during a pulse restarts it.
 local function press_pulse(data)
-  local off = game.tick + pulse_duration(data, data.entity)
-  data.off_tick = off
+  schedule_release(data, pulse_duration(data, data.entity))
   set_state(data, true, "gofarovich-bc-press")
-  storage.pending[off] = storage.pending[off] or {}
-  table.insert(storage.pending[off], data.entity.unit_number)
 end
 
 local function press_switch(data)
@@ -422,10 +433,20 @@ local function open_gui(player, data)
   local tbl = content.add{ type = "table", name = "tbl", column_count = 2 }
   tbl.style.horizontally_stretchable = true
   -- Подписи слева тянутся, прижимая инпуты ко второму столбцу — к правому краю.
+  -- active/idle outputs: a signal AND a count (e.g. send -60 tanks while pressed),
+  -- via gglib's with_count picker. Result comes back through SP.set_on_pick by target.slot.
   tbl.add{ type = "label", caption = { "gofarovich-bc-gui.active-signal" } }.style.horizontally_stretchable = true
-  tbl.add{ type = "choose-elem-button", name = "gofarovich-bc-active-signal", elem_type = "signal", signal = data.active_signal }
+  SB.build(tbl, {
+    target = { unit = data.entity.unit_number, slot = "active" },
+    value = { use_signal = true, signal = data.active_signal, count = data.active_count or 1 },
+    with_count = true,
+  })
   tbl.add{ type = "label", caption = { "gofarovich-bc-gui.inactive-signal" } }.style.horizontally_stretchable = true
-  tbl.add{ type = "choose-elem-button", name = "gofarovich-bc-inactive-signal", elem_type = "signal", signal = data.inactive_signal }
+  SB.build(tbl, {
+    target = { unit = data.entity.unit_number, slot = "inactive" },
+    value = { use_signal = true, signal = data.inactive_signal, count = data.inactive_count or 1 },
+    with_count = true,
+  })
 
   if data.entity.name == "gofarovich-bc-pulse" then
     tbl.add{ type = "label", caption = { "gofarovich-bc-gui.duration" }, tooltip = { "gofarovich-bc-gui.duration-tt" } }.style.horizontally_stretchable = true
@@ -502,6 +523,23 @@ end
 SP.set_on_pick(function(player, target, result, changed)
   local data = storage.buttons[target.unit]
   if not (data and data.entity.valid) then return end
+  -- active/idle output slots: signal + count
+  if target.slot then
+    if changed then
+      local sig = result and result.signal
+      local count = math.floor((result and result.count) or 1)
+      if target.slot == "active" then
+        data.active_signal = sig
+        data.active_count = count
+      else
+        data.inactive_signal = sig
+        data.inactive_count = count
+      end
+      set_output(data)
+    end
+    open_gui(player, data)
+    return
+  end
   if changed and target.cond == "duration" then
     -- только число: константа → длина импульса (минимум 1 тик)
     local n = (result and result.constant) or 1
@@ -662,13 +700,7 @@ script.on_event(defines.events.on_gui_elem_changed, function(event)
   local name = event.element.name
   local data = get_open_data(event)
   if not data then return end
-  if name == "gofarovich-bc-active-signal" then
-    data.active_signal = event.element.elem_value
-    set_output(data)
-  elseif name == "gofarovich-bc-inactive-signal" then
-    data.inactive_signal = event.element.elem_value
-    set_output(data)
-  elseif name == EN_SIG then
+  if name == EN_SIG then
     data.enable_cond.signal = event.element.elem_value
   elseif name == DIS_SIG then
     data.disable_cond.signal = event.element.elem_value
@@ -730,7 +762,9 @@ script.on_event(defines.events.on_entity_settings_pasted, function(event)
     return { signal = c.signal, comparator = c.comparator, use_signal = c.use_signal, second_signal = c.second_signal, constant = c.constant }
   end
   dst_data.active_signal = src_data.active_signal
+  dst_data.active_count = src_data.active_count or 1
   dst_data.inactive_signal = src_data.inactive_signal
+  dst_data.inactive_count = src_data.inactive_count or 1
   local sd = norm_duration(src_data.duration)
   dst_data.duration = { use_signal = false, second_signal = sd.second_signal, constant = sd.constant }
   dst_data.auto = src_data.auto
@@ -746,23 +780,55 @@ local filters = {
   { filter = "name", name = "gofarovich-bc-switch" },
 }
 
+-- Настройки кнопки <-> таблица-тег "cb". Один формат на все каналы переноса:
+-- блюпринты, undo/redo и призраки после смерти — всё едет через теги призрака
+-- и возвращается в on_built.
+local function tag_data(data, desc)
+  return {
+    active = data.active_signal,
+    active_count = data.active_count,
+    inactive = data.inactive_signal,
+    inactive_count = data.inactive_count,
+    duration = data.duration,
+    state = data.state,
+    -- Ticks left of a running pulse. A timer button copied / blueprinted / undone
+    -- while lit used to come back lit with nothing scheduled to switch it off, so
+    -- it stayed on forever. Carry the leftover and restart the countdown on build.
+    remaining = (data.off_tick and data.off_tick > game.tick) and (data.off_tick - game.tick) or nil,
+    desc = desc,
+    auto = data.auto,
+    enable_cond = data.enable_cond,
+    disable_cond = data.disable_cond,
+  }
+end
+
+local function apply_tags(data, t, entity)
+  data.active_signal = t.active
+  data.active_count = t.active_count or 1
+  data.inactive_signal = t.inactive
+  data.inactive_count = t.inactive_count or 1
+  if t.duration then data.duration = norm_duration(t.duration) end
+  data.state = t.state or false
+  if t.desc and t.desc ~= "" then entity.combinator_description = t.desc end
+  data.auto = t.auto or false
+  if t.enable_cond then data.enable_cond = t.enable_cond end
+  if t.disable_cond then data.disable_cond = t.disable_cond end
+  set_auto_tracking(data)
+  -- Restart the pulse countdown from whatever was left when the button was copied
+  -- (older tags have no `remaining` — fall back to a full-length pulse).
+  data.off_tick = nil
+  if data.state and entity.name == "gofarovich-bc-pulse" then
+    schedule_release(data, t.remaining or pulse_duration(data, entity))
+  end
+end
+
 local function on_built(event)
   local entity = event.entity
   if not (entity and entity.valid) then return end
   local data = register(entity)
   -- Restore mod data from blueprint tags (see on_player_setup_blueprint).
   local t = event.tags and event.tags.cb
-  if t then
-    data.active_signal = t.active
-    data.inactive_signal = t.inactive
-    if t.duration then data.duration = norm_duration(t.duration) end
-    data.state = t.state or false
-    if t.desc and t.desc ~= "" then entity.combinator_description = t.desc end
-    data.auto = t.auto or false
-    if t.enable_cond then data.enable_cond = t.enable_cond end
-    if t.disable_cond then data.disable_cond = t.disable_cond end
-    set_auto_tracking(data)
-  end
+  if t then apply_tags(data, t, entity) end
   -- Keep the side the entity was placed/blueprinted with (Q-pipette, paste and
   -- blueprints carry a direction); only re-derive the on/off half from our state.
   entity.direction = face_dir(is_button_face(entity), data.state)
@@ -798,25 +864,42 @@ script.on_event(defines.events.on_player_setup_blueprint, function(event)
     if real and real.valid and NAMES[real.name] then
       local data = storage.buttons[real.unit_number]
       if data then
-        bp.set_blueprint_entity_tag(idx, "cb", {
-          active = data.active_signal,
-          inactive = data.inactive_signal,
-          duration = data.duration,
-          state = data.state,
-          desc = real.combinator_description,
-          auto = data.auto,
-          enable_cond = data.enable_cond,
-          disable_cond = data.disable_cond,
-        })
+        bp.set_blueprint_entity_tag(idx, "cb", tag_data(data, real.combinator_description))
       end
     end
   end
 end)
 
+-- Undo/redo и восстановление после смерти. Движковый undo-стек сам не носит
+-- данные мода: Ctrl+Z после сноса ставил призрака без тегов, и on_built
+-- регистрировал кнопку с дефолтами. Поэтому при удалении настройки прячутся в
+-- storage.undo_stash по ключу (поверхность, имя, позиция), а когда undo/redo
+-- (или смерть) создаёт там призрака — стэш пишется в его теги и штатно
+-- возвращается в on_built при оживлении.
+local function stash_key(surface_index, name, pos)
+  return string.format("%d:%s:%.2f:%.2f", surface_index, name, pos.x, pos.y)
+end
+
+local STASH_LIMIT = 200 -- ограничитель, чтобы никогда-не-отменённые сносы не копились в сейве
+
+local function stash_settings(entity, data)
+  local stash = storage.undo_stash
+  stash[stash_key(entity.surface.index, entity.name, entity.position)] =
+    { tick = game.tick, cb = tag_data(data, entity.combinator_description) }
+  local count, oldest_key, oldest_tick = 0, nil, math.huge
+  for k, v in pairs(stash) do
+    count = count + 1
+    if v.tick < oldest_tick then oldest_key, oldest_tick = k, v.tick end
+  end
+  if count > STASH_LIMIT then stash[oldest_key] = nil end
+end
+
 local function on_removed(event)
   local entity = event.entity
   if not (entity and NAMES[entity.name]) then return end
-  if storage.buttons[entity.unit_number] then
+  local data = storage.buttons[entity.unit_number]
+  if data then
+    stash_settings(entity, data)
     storage.buttons[entity.unit_number] = nil
     storage.auto[entity.unit_number] = nil
   end
@@ -826,3 +909,48 @@ script.on_event(defines.events.on_player_mined_entity, on_removed, filters)
 script.on_event(defines.events.on_robot_mined_entity, on_removed, filters)
 script.on_event(defines.events.on_entity_died, on_removed, filters)
 script.on_event(defines.events.script_raised_destroy, on_removed, filters)
+
+local function restore_from_stash(surface_index, name, pos)
+  local saved = storage.undo_stash[stash_key(surface_index, name, pos)]
+  if not saved then return end
+  local surface = game.get_surface(surface_index)
+  if not surface then return end
+  -- обычный случай: undo поставил призрака — теги доедут до on_built при оживлении
+  local ghost = surface.find_entities_filtered{ ghost_name = name, position = pos, limit = 1 }[1]
+  if ghost then
+    local tags = ghost.tags or {}
+    tags.cb = saved.cb
+    ghost.tags = tags
+    return
+  end
+  -- мгновенная постройка (редактор/чит-режим): сущность уже реальная и on_built
+  -- успел зарегистрировать её с дефолтами — накатываем сохранённое поверх
+  local real = surface.find_entities_filtered{ name = name, position = pos, limit = 1 }[1]
+  if real then
+    local data = get_data(real)
+    apply_tags(data, saved.cb, real)
+    real.direction = face_dir(is_button_face(real), data.state)
+    set_output(data)
+  end
+end
+
+local function on_undo_redo(event)
+  for _, action in pairs(event.actions) do
+    local target = action.target
+    if target and NAMES[target.name]
+      and (action.type == "removed-entity" or action.type == "built-entity") then
+      restore_from_stash(action.surface_index, target.name, target.position)
+    end
+  end
+end
+
+script.on_event(defines.events.on_undo_applied, on_undo_redo)
+script.on_event(defines.events.on_redo_applied, on_undo_redo)
+
+-- Смерть кнопки: on_entity_died (on_removed выше) уже спрятал настройки в стэш,
+-- здесь вешаем их на созданного движком призрака — боты отстроят кнопку как была.
+script.on_event(defines.events.on_post_entity_died, function(event)
+  if not (event.ghost and event.prototype and NAMES[event.prototype.name]) then return end
+  local saved = storage.undo_stash[stash_key(event.surface_index, event.prototype.name, event.position)]
+  if saved then event.ghost.tags = { cb = saved.cb } end
+end)

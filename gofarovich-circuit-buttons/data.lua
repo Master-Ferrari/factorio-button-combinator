@@ -3,13 +3,15 @@ require("util")
 local g = "__button-combinator__/graphics/"
 local atlas = g .. "atlas.png"
 local shadow = g .. "atlas-shadow.png"
+local luminance = g .. "luminance.png" -- same layout as atlas.png; opaque black bg, so drawn additively
 local husk = g .. "husk.png"   -- remnant sheet: two 128x128 variations
 
--- main frame + matching shadow layer (same x/y in the shadow atlas)
+-- main frame + glow (visible at night) + matching shadow layer (same x/y in every atlas)
 local function cell(x, y)
   return {
     layers = {
       { filename = atlas, x = x, y = y, width = 128, height = 128, scale = 0.5 },
+      { filename = luminance, x = x, y = y, width = 128, height = 128, scale = 0.5, draw_as_glow = true, blend_mode = "additive" },
       { filename = shadow, x = x, y = y, width = 128, height = 128, scale = 0.5, draw_as_shadow = true },
     },
   }

@@ -1,9 +1,30 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.3.2
+Date: 2026-09-04
+  Changes:
+    - the pulse button is now called the timer button - same button, just a name that says what it does
+  Bugfixes:
+    - copying a timer button while it was lit no longer gives you a copy that's stuck on forever:
+      the copy remembers how many ticks were left and counts them down from the moment you place it
+---------------------------------------------------------------------------------------------------
+Version: 0.3.1
+Date: 2026-08-31
+  Bugfixes:
+    - button settings survive undo now: mine a button, ctrl+z it back, and it remembers its setup
+    - same for buttons destroyed by biters and rebuilt from ghosts by bots
+---------------------------------------------------------------------------------------------------
+Version: 0.3.0
+Date: 2026-08-24
+  Changes:
+    - buttons now glow in the dark when active
+    - updated for Factorio 2.1
+---------------------------------------------------------------------------------------------------
 Version: 0.2.0
 Date: 2026-06-24
   Changes:
     - big gui rework! so big it didn't fit here anymore, so the gui stuff now lives in its own mod (gglib)
     - settings window feels nicer to use now
+    - active/idle signals now have a count too, so you can fire off e.g. -60 tanks instead of just 1
   Info:
     - this mod now needs gglib to work, the game will grab it for you
 ---------------------------------------------------------------------------------------------------
