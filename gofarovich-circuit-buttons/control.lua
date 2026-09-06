@@ -144,6 +144,48 @@ local function is_locked(data)
   return eval_cond(data.entity, data.enable_cond) or eval_cond(data.entity, data.disable_cond)
 end
 
+-- SignalID leaves `type` out for plain items, so a missing type means "item",
+-- never "virtual" -- defaulting it the other way makes set_slot reject every item
+-- signal outright ("Unknown virtual-signal name: gun-turret").
+local function signal_type(signal)
+  return signal.type or "item"
+end
+
+local function signal_value(signal)
+  return { type = signal_type(signal), name = signal.name, quality = signal.quality or "normal" }
+end
+
+-- Blueprint parametrisation ("parameter-0" & co) is the engine's job, and the
+-- engine only rewrites fields it knows: for a constant combinator, its filters.
+-- Every signal a player picks here lives in our own storage and rides blueprints
+-- inside the `cb` tag, which the engine never looks at -- so none of these signals
+-- ever reached the parameter dialog.
+--
+-- Fix: while a blueprint is being taken, copy each picked signal into an extra
+-- combinator section of the BLUEPRINT ENTITY (see mirror_into). Those sections
+-- exist in blueprint data only; on_built reads the substituted signals out of them
+-- and strips them off the real entity before the tick ends, so a live button still
+-- has exactly one section and never emits anything extra.
+--
+-- One section per signal, deliberately: a section cannot hold the same signal
+-- twice, and two pickers may well point at the same one.
+local MIRROR_SLOTS = {
+  -- The filter's count carries which picker it belongs to, so the read side does
+  -- not depend on section order surviving the round trip. Append, never reshuffle.
+  { get = function(d) return d.active_signal end,
+    set = function(d, signal) d.active_signal = signal end },
+  { get = function(d) return d.inactive_signal end,
+    set = function(d, signal) d.inactive_signal = signal end },
+  { get = function(d) return d.enable_cond and d.enable_cond.signal end,
+    set = function(d, signal) d.enable_cond.signal = signal end },
+  { get = function(d) return d.enable_cond and d.enable_cond.use_signal and d.enable_cond.second_signal or nil end,
+    set = function(d, signal) d.enable_cond.second_signal = signal end },
+  { get = function(d) return d.disable_cond and d.disable_cond.signal end,
+    set = function(d, signal) d.disable_cond.signal = signal end },
+  { get = function(d) return d.disable_cond and d.disable_cond.use_signal and d.disable_cond.second_signal or nil end,
+    set = function(d, signal) d.disable_cond.second_signal = signal end },
+}
+
 local function set_output(data)
   local cb = data.entity.get_or_create_control_behavior()
   local section = cb.get_section(1) or cb.add_section()
@@ -151,7 +193,7 @@ local function set_output(data)
   local count = data.state and (data.active_count or 1) or (data.inactive_count or 1)
   if signal and signal.name then
     section.set_slot(1, {
-      value = { type = signal.type or "virtual", name = signal.name, quality = signal.quality or "normal" },
+      value = signal_value(signal),
       min = count, -- constant-combinator outputs this count
     })
   else
@@ -611,7 +653,15 @@ end
 script.on_event(defines.events.on_gui_opened, function(event)
   if event.gui_type ~= defines.gui_type.entity then return end
   local entity = event.entity
-  if not (entity and entity.valid and NAMES[entity.name]) then return end
+  if not (entity and entity.valid) then return end
+  -- A ghost keeps its real name in ghost_name, so the check below never matched it
+  -- and the player got the raw constant-combinator window. Nothing there is ours to
+  -- show (least of all the blueprint mirror sections), so just close it.
+  if entity.name == "entity-ghost" and NAMES[entity.ghost_name] then
+    game.get_player(event.player_index).opened = nil
+    return
+  end
+  if not NAMES[entity.name] then return end
   local player = game.get_player(event.player_index)
   player.opened = nil
   local data = get_data(entity)
@@ -784,7 +834,12 @@ local filters = {
 -- блюпринты, undo/redo и призраки после смерти — всё едет через теги призрака
 -- и возвращается в on_built.
 local function tag_data(data, desc)
+  -- Which way the button faces. direction alone cannot be trusted on the way back:
+  -- it encodes (side, on/off) together, so rotating a blueprint rewrites both.
+  local front
+  if data.entity and data.entity.valid then front = is_button_face(data.entity) end
   return {
+    front = front,
     active = data.active_signal,
     active_count = data.active_count,
     inactive = data.inactive_signal,
@@ -820,6 +875,62 @@ local function apply_tags(data, t, entity)
   if data.state and entity.name == "gofarovich-bc-pulse" then
     schedule_release(data, t.remaining or pulse_duration(data, entity))
   end
+  -- All four directions are spoken for by (side, on/off), so a rotated blueprint
+  -- landed the button on its terminal side or with its state flipped. Both halves
+  -- come from our own data instead; how the blueprint was turned is ignored.
+  -- (Tags written before `front` existed fall back to the placed direction.)
+  local front = t.front
+  if front == nil then front = is_button_face(entity) end
+  entity.direction = face_dir(front, data.state)
+end
+
+-- Pull the mirror sections off a freshly built entity. Everything past section 1
+-- is ours: one filter each, whose count says which picker it belongs to and whose
+-- signal the engine has already substituted parameters into.
+local function read_mirror(entity)
+  local cb = entity.get_control_behavior()
+  if not cb then return nil end
+  local sections = cb.sections
+  local captured
+  for index = 2, #sections do
+    local slot = sections[index].get_slot(1)
+    local value = slot and slot.value
+    local which = slot and slot.min
+    if value and value.name and which and which >= 1 and which <= #MIRROR_SLOTS then
+      captured = captured or {}
+      captured[which] = { type = value.type or "item", name = value.name, quality = value.quality }
+    end
+  end
+  return captured
+end
+
+local function apply_mirror(data, captured)
+  for index, slot in ipairs(MIRROR_SLOTS) do
+    local signal = captured[index]
+    if signal then slot.set(data, signal) end
+  end
+end
+
+-- A real button owns exactly one section. Anything above it arrived from a
+-- blueprint and has to go before it can put a signal on the wire.
+local function strip_mirror(entity)
+  local cb = entity.get_control_behavior()
+  if not cb then return end
+  for index = #cb.sections, 2, -1 do
+    cb.remove_section(index)
+  end
+end
+
+-- Fallback for blueprints taken before the mirror existed: back then the only
+-- field the engine could substitute was the output filter in slot 1 of section 1.
+local function built_slot(entity)
+  local cb = entity.get_control_behavior()
+  local section = cb and cb.get_section(1)
+  local slot = section and section.get_slot(1)
+  local value = slot and slot.value
+  if value and value.name then
+    return { type = value.type or "virtual", name = value.name, quality = value.quality }, slot.min
+  end
 end
 
 local function on_built(event)
@@ -828,7 +939,28 @@ local function on_built(event)
   local data = register(entity)
   -- Restore mod data from blueprint tags (see on_player_setup_blueprint).
   local t = event.tags and event.tags.cb
-  if t then apply_tags(data, t, entity) end
+  if t then
+    -- Read what the engine actually built before the tag puts our raw copy back,
+    -- then get the mirror off the entity in the same handler -- no tick passes
+    -- with those sections live, so nothing of theirs reaches the network.
+    local captured = read_mirror(entity)
+    local signal, count = built_slot(entity)
+    strip_mirror(entity)
+    apply_tags(data, t, entity)
+    if captured then
+      apply_mirror(data, captured)
+    elseif signal then
+      -- pre-mirror blueprint: slot 1 held whichever half was live when it was
+      -- taken, so the substituted signal belongs to the state it comes back in.
+      if data.state then
+        data.active_signal = signal
+        data.active_count = count or data.active_count
+      else
+        data.inactive_signal = signal
+        data.inactive_count = count or data.inactive_count
+      end
+    end
+  end
   -- Keep the side the entity was placed/blueprinted with (Q-pipette, paste and
   -- blueprints carry a direction); only re-derive the on/off half from our state.
   entity.direction = face_dir(is_button_face(entity), data.state)
@@ -851,6 +983,38 @@ local function blueprint_stack(player)
   return nil
 end
 
+-- Append one section per picked signal to a blueprint entity, so the parameter
+-- dialog can see them and substitute into them. Section 1 stays the button's real
+-- output; the extras start at 2 and carry their picker index in the filter count.
+-- No `group` is set on purpose: a named section is a logistic group, i.e. a global
+-- the player would find in their own list.
+local function mirror_into(ent, data)
+  local behavior = ent.control_behavior or {}
+  local wrapper = behavior.sections or {}
+  local list = wrapper.sections or {}
+  -- Guarantee the output section exists, so the mirror never lands on index 1.
+  if #list == 0 then list[1] = { index = 1 } end
+  for which, slot in ipairs(MIRROR_SLOTS) do
+    local signal = slot.get(data)
+    if signal and signal.name then
+      list[#list + 1] = {
+        index = #list + 1,
+        filters = { {
+          index = 1,
+          type = signal_type(signal),
+          name = signal.name,
+          quality = signal.quality or "normal",
+          comparator = "=",
+          count = which, -- which picker this section stands for
+        } },
+      }
+    end
+  end
+  wrapper.sections = list
+  behavior.sections = wrapper
+  ent.control_behavior = behavior
+end
+
 script.on_event(defines.events.on_player_setup_blueprint, function(event)
   local player = game.get_player(event.player_index)
   local bp = blueprint_stack(player)
@@ -858,16 +1022,21 @@ script.on_event(defines.events.on_player_setup_blueprint, function(event)
   local entities = bp.get_blueprint_entities()
   if not entities then return end
   local mapping = event.mapping.get()
+  local touched = false
   for _, ent in pairs(entities) do
-    local idx = ent.entity_number
-    local real = mapping[idx]
+    local real = mapping[ent.entity_number]
     if real and real.valid and NAMES[real.name] then
       local data = storage.buttons[real.unit_number]
       if data then
-        bp.set_blueprint_entity_tag(idx, "cb", tag_data(data, real.combinator_description))
+        -- tags go in the same write: set_blueprint_entities replaces the lot
+        ent.tags = ent.tags or {}
+        ent.tags.cb = tag_data(data, real.combinator_description)
+        mirror_into(ent, data)
+        touched = true
       end
     end
   end
+  if touched then bp.set_blueprint_entities(entities) end
 end)
 
 -- Undo/redo и восстановление после смерти. Движковый undo-стек сам не носит
